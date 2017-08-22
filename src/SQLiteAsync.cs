@@ -36,6 +36,8 @@ namespace SQLite
 	public partial class SQLiteAsyncConnection
 	{
 		SQLiteConnectionString _connectionString;
+		SQLiteConnectionWithLock _fullMutexReadConnection;
+		bool isFullMutex;
 		SQLiteOpenFlags _openFlags;
 
 		/// <summary>
@@ -53,7 +55,7 @@ namespace SQLite
 		/// the storeDateTimeAsTicks parameter.
 		/// </param>
 		public SQLiteAsyncConnection (string databasePath, bool storeDateTimeAsTicks = true)
-			: this (databasePath, SQLiteOpenFlags.ReadWrite | SQLiteOpenFlags.Create, storeDateTimeAsTicks)
+			: this (databasePath, SQLiteOpenFlags.FullMutex | SQLiteOpenFlags.ReadWrite | SQLiteOpenFlags.Create, storeDateTimeAsTicks)
 		{
 		}
 
@@ -77,7 +79,10 @@ namespace SQLite
 		public SQLiteAsyncConnection (string databasePath, SQLiteOpenFlags openFlags, bool storeDateTimeAsTicks = true)
 		{
 			_openFlags = openFlags;
+			isFullMutex = _openFlags.HasFlag (SQLiteOpenFlags.FullMutex);
 			_connectionString = new SQLiteConnectionString (databasePath, storeDateTimeAsTicks);
+			if(isFullMutex)
+				_fullMutexReadConnection = new SQLiteConnectionWithLock (_connectionString, openFlags) { SkipLock = true };
 		}
 
 		/// <summary>
@@ -181,7 +186,7 @@ namespace SQLite
 		Task<T> ReadAsync<T> (Func<SQLiteConnectionWithLock, T> read)
 		{
 			return Task.Factory.StartNew (() => {
-				var conn = GetConnection ();
+				var conn = isFullMutex ? _fullMutexReadConnection : GetConnection ();
 				using (conn.Lock ()) {
 					return read (conn);
 				}
@@ -195,6 +200,39 @@ namespace SQLite
 				using (conn.Lock ()) {
 					return write (conn);
 				}
+			});
+		}
+
+		/// <summary>
+		/// Sets the key used to encrypt/decrypt the database.
+		/// This must be the first thing you call before doing anything else with this connection
+		/// if your database is encrypted.
+		/// This only has an effect if you are using the SQLCipher nuget package.
+		/// </summary>
+		/// <param name="key">Ecryption key plain text that is converted to the real encryption key using PBKDF2 key derivation</param>
+		public Task SetKeyAsync (string key)
+		{
+			if (key == null) throw new ArgumentNullException (nameof (key));
+			return WriteAsync<object> (conn => {
+				conn.SetKey (key);
+				return null;
+			});
+		}
+
+		/// <summary>
+		/// Sets the key used to encrypt/decrypt the database.
+		/// This must be the first thing you call before doing anything else with this connection
+		/// if your database is encrypted.
+		/// This only has an effect if you are using the SQLCipher nuget package.
+		/// </summary>
+		/// <param name="key">256-bit (32 byte) ecryption key data</param>
+		public Task SetKeyAsync (byte[] key)
+		{
+			if (key == null) throw new ArgumentNullException (nameof (key));
+			if (key.Length != 32) throw new ArgumentException ("Key must be 32 bytes (256-bit)", nameof (key));
+			return WriteAsync<object> (conn => {
+				conn.SetKey (key);
+				return null;
 			});
 		}
 
@@ -1378,13 +1416,19 @@ namespace SQLite
 		}
 
 		/// <summary>
+		/// Gets or sets a value indicating whether this <see cref="T:SQLite.SQLiteConnectionWithLock"/> skip lock.
+		/// </summary>
+		/// <value><c>true</c> if skip lock; otherwise, <c>false</c>.</value>
+		public bool SkipLock { get; set; }
+
+		/// <summary>
 		/// Lock the database to serialize access to it. To unlock it, call Dispose
 		/// on the returned object.
 		/// </summary>
 		/// <returns>The lock.</returns>
 		public IDisposable Lock ()
 		{
-			return new LockWrapper (_lockPoint);
+			return SkipLock ? (IDisposable)new FakeLockWrapper() : new LockWrapper (_lockPoint);
 		}
 
 		class LockWrapper : IDisposable
@@ -1400,6 +1444,12 @@ namespace SQLite
 			public void Dispose ()
 			{
 				Monitor.Exit (_lockPoint);
+			}
+		}
+		class FakeLockWrapper : IDisposable
+		{
+			public void Dispose ()
+			{
 			}
 		}
 	}

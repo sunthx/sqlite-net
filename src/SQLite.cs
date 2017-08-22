@@ -1,16 +1,16 @@
 //
 // Copyright (c) 2009-2017 Krueger Systems, Inc.
-// 
+//
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
 // in the Software without restriction, including without limitation the rights
 // to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 // copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
-// 
+//
 // The above copyright notice and this permission notice shall be included in
 // all copies or substantial portions of the Software.
-// 
+//
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -30,15 +30,10 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 #endif
 using System.Collections.Generic;
-#if NO_CONCURRENT
-using ConcurrentStringDictionary = System.Collections.Generic.Dictionary<string, object>;
-using SQLite.Extensions;
-#else
-using ConcurrentStringDictionary = System.Collections.Concurrent.ConcurrentDictionary<string, object>;
-#endif
 using System.Reflection;
 using System.Linq;
 using System.Linq.Expressions;
+using System.Text;
 using System.Threading;
 
 #if USE_CSHARP_SQLITE
@@ -165,12 +160,12 @@ namespace SQLite
 	/// <summary>
 	/// An open connection to a SQLite database.
 	/// </summary>
+	[Preserve (AllMembers = true)]
 	public partial class SQLiteConnection : IDisposable
 	{
 		private bool _open;
 		private TimeSpan _busyTimeout;
-		private Dictionary<string, TableMapping> _mappings = null;
-		private Dictionary<string, TableMapping> _tables = null;
+		readonly static Dictionary<string, TableMapping> _mappings = new Dictionary<string, TableMapping> ();
 		private System.Diagnostics.Stopwatch _sw;
 		private long _elapsedMilliseconds = 0;
 
@@ -178,7 +173,7 @@ namespace SQLite
 		private Random _rand = new Random ();
 
 		public Sqlite3DatabaseHandle Handle { get; private set; }
-		internal static readonly Sqlite3DatabaseHandle NullHandle = default (Sqlite3DatabaseHandle);
+		static readonly Sqlite3DatabaseHandle NullHandle = default (Sqlite3DatabaseHandle);
 
 		/// <summary>
 		/// Gets the database path used by this connection.
@@ -257,8 +252,8 @@ namespace SQLite
 		/// </param>
 		public SQLiteConnection (string databasePath, SQLiteOpenFlags openFlags, bool storeDateTimeAsTicks = true)
 		{
-			if (string.IsNullOrEmpty (databasePath))
-				throw new ArgumentException ("Must be specified", "databasePath");
+			if (databasePath==null)
+				throw new ArgumentException ("Must be specified", nameof(databasePath));
 
 			DatabasePath = databasePath;
 
@@ -289,25 +284,53 @@ namespace SQLite
 			StoreDateTimeAsTicks = storeDateTimeAsTicks;
 
 			BusyTimeout = TimeSpan.FromSeconds (0.1);
-
+			if (openFlags.HasFlag (SQLiteOpenFlags.ReadWrite)) {
+				ExecuteScalar<string> ("PRAGMA journal_mode=WAL");
+			}
 			Tracer = line => Debug.WriteLine (line);
 		}
 
-#if __IOS__
-		static SQLiteConnection ()
+		/// <summary>
+		/// Convert an input string to a quoted SQL string that can be safely used in queries.
+		/// </summary>
+		/// <returns>The quoted string.</returns>
+		/// <param name="unsafeString">The unsafe string to quote.</param>
+		static string Quote (string unsafeString)
 		{
-			if (_preserveDuringLinkMagic) {
-				var ti = new ColumnInfo ();
-				ti.Name = "magic";
-			}
+			// TODO: Doesn't call sqlite3_mprintf("%Q", u) because we're waiting on https://github.com/ericsink/SQLitePCL.raw/issues/153
+			if (unsafeString == null) return "NULL";
+			var safe = unsafeString.Replace ("'", "''");
+			return "'" + safe + "'";
 		}
 
-   		/// <summary>
-		/// Used to list some code that we want the MonoTouch linker
-		/// to see, but that we never want to actually execute.
+		/// <summary>
+		/// Sets the key used to encrypt/decrypt the database.
+		/// This must be the first thing you call before doing anything else with this connection
+		/// if your database is encrypted.
+		/// This only has an effect if you are using the SQLCipher nuget package.
 		/// </summary>
-		static bool _preserveDuringLinkMagic;
-#endif
+		/// <param name="key">Ecryption key plain text that is converted to the real encryption key using PBKDF2 key derivation</param>
+		public void SetKey (string key)
+		{
+			if (key == null) throw new ArgumentNullException (nameof (key));
+			var q = Quote (key);
+			Execute ("pragma key = " + q);
+		}
+
+		/// <summary>
+		/// Sets the key used to encrypt/decrypt the database.
+		/// This must be the first thing you call before doing anything else with this connection
+		/// if your database is encrypted.
+		/// This only has an effect if you are using the SQLCipher nuget package.
+		/// </summary>
+		/// <param name="key">256-bit (32 byte) ecryption key data</param>
+		public void SetKey (byte[] key)
+		{
+			if (key == null) throw new ArgumentNullException (nameof (key));
+			if (key.Length != 32) throw new ArgumentException ("Key must be 32 bytes (256-bit)", nameof(key));
+			var s = String.Join ("", key.Select (x => x.ToString ("X2")));
+			Execute ("pragma key = \"x'" + s + "'\"");
+		}
 
 		/// <summary>
 		/// Enable or disable extension loading.
@@ -351,7 +374,9 @@ namespace SQLite
 		/// </summary>
 		public IEnumerable<TableMapping> TableMappings {
 			get {
-				return _tables != null ? _tables.Values : Enumerable.Empty<TableMapping> ();
+				lock (_mappings) {
+					return new List<TableMapping> (_mappings.Values);
+				}
 			}
 		}
 
@@ -360,23 +385,29 @@ namespace SQLite
 		/// </summary>
 		/// <param name="type">
 		/// The type whose mapping to the database is returned.
-		/// </param>         
+		/// </param>
 		/// <param name="createFlags">
 		/// Optional flags allowing implicit PK and indexes based on naming conventions
-		/// </param>     
+		/// </param>
 		/// <returns>
-		/// The mapping represents the schema of the columns of the database and contains 
+		/// The mapping represents the schema of the columns of the database and contains
 		/// methods to set and get properties of objects.
 		/// </returns>
 		public TableMapping GetMapping (Type type, CreateFlags createFlags = CreateFlags.None)
 		{
-			if (_mappings == null) {
-				_mappings = new Dictionary<string, TableMapping> ();
-			}
 			TableMapping map;
-			if (!_mappings.TryGetValue (type.FullName, out map)) {
-				map = new TableMapping (type, createFlags);
-				_mappings[type.FullName] = map;
+			var key = type.FullName;
+			lock (_mappings) {
+				if (_mappings.TryGetValue (key, out map)) {
+					if (createFlags != CreateFlags.None && createFlags != map.CreateFlags) {
+						map = new TableMapping (type, createFlags);
+						_mappings[key] = map;
+					}
+				}
+				else {
+					map = new TableMapping (type, createFlags);
+					_mappings.Add (key, map);
+				}
 			}
 			return map;
 		}
@@ -386,9 +417,9 @@ namespace SQLite
 		/// </summary>
 		/// <param name="createFlags">
 		/// Optional flags allowing implicit PK and indexes based on naming conventions
-		/// </param>     
+		/// </param>
 		/// <returns>
-		/// The mapping represents the schema of the columns of the database and contains 
+		/// The mapping represents the schema of the columns of the database and contains
 		/// methods to set and get properties of objects.
 		/// </returns>
 		public TableMapping GetMapping<T> (CreateFlags createFlags = CreateFlags.None)
@@ -451,24 +482,17 @@ namespace SQLite
 		/// later access this schema by calling GetMapping.
 		/// </summary>
 		/// <param name="ty">Type to reflect to a database table.</param>
-		/// <param name="createFlags">Optional flags allowing implicit PK and indexes based on naming conventions.</param>  
+		/// <param name="createFlags">Optional flags allowing implicit PK and indexes based on naming conventions.</param>
 		/// <returns>
 		/// Whether the table was created or migrated.
 		/// </returns>
 		public CreateTableResult CreateTable (Type ty, CreateFlags createFlags = CreateFlags.None)
 		{
-			if (_tables == null) {
-				_tables = new Dictionary<string, TableMapping> ();
-			}
-			TableMapping map;
-			if (!_tables.TryGetValue (ty.FullName, out map)) {
-				map = GetMapping (ty, createFlags);
-				_tables.Add (ty.FullName, map);
-			}
+			var map = GetMapping (ty, createFlags);
 
 			// Present a nice error if no columns specified
 			if (map.Columns.Length == 0) {
-				throw new Exception (string.Format ("Cannot create a table with zero columns (does '{0}' have public properties?)", ty.FullName));
+				throw new Exception (string.Format ("Cannot create a table without columns (does '{0}' have public properties?)", ty.FullName));
 			}
 
 			// Check if the table exists
@@ -491,6 +515,9 @@ namespace SQLite
 				var decl = string.Join (",\n", decls.ToArray ());
 				query += decl;
 				query += ")";
+				if(map.WithoutRowId) {
+					query += " without rowid";
+				}
 
 				Execute (query);
 			}
@@ -699,6 +726,7 @@ namespace SQLite
 			return CreateIndex (map.TableName, colName, unique);
 		}
 
+		[Preserve (AllMembers = true)]
 		public class ColumnInfo
 		{
 			//			public int cid { get; set; }
@@ -903,7 +931,8 @@ namespace SQLite
 		/// </param>
 		/// <returns>
 		/// An enumerable with one result for each row returned by the query.
-		/// The enumerator will call sqlite3_step on each call to MoveNext, so the database
+		/// The enumerator (retrieved by calling GetEnumerator() on the result of this method)
+		/// will call sqlite3_step on each call to MoveNext, so the database
 		/// connection must remain open for the lifetime of the enumerator.
 		/// </returns>
 		public IEnumerable<T> DeferredQuery<T> (string query, params object[] args) where T : new()
@@ -957,7 +986,8 @@ namespace SQLite
 		/// </param>
 		/// <returns>
 		/// An enumerable with one result for each row returned by the query.
-		/// The enumerator will call sqlite3_step on each call to MoveNext, so the database
+		/// The enumerator (retrieved by calling GetEnumerator() on the result of this method)
+		/// will call sqlite3_step on each call to MoveNext, so the database
 		/// connection must remain open for the lifetime of the enumerator.
 		/// </returns>
 		public IEnumerable<object> DeferredQuery (TableMapping map, string query, params object[] args)
@@ -1018,7 +1048,7 @@ namespace SQLite
 
 		/// <summary>
 		/// Attempts to retrieve the first object that matches the predicate from the table
-		/// associated with the specified type. 
+		/// associated with the specified type.
 		/// </summary>
 		/// <param name="predicate">
 		/// A predicate for which object to find.
@@ -1072,7 +1102,7 @@ namespace SQLite
 
 		/// <summary>
 		/// Attempts to retrieve the first object that matches the predicate from the table
-		/// associated with the specified type. 
+		/// associated with the specified type.
 		/// </summary>
 		/// <param name="predicate">
 		/// A predicate for which object to find.
@@ -1088,7 +1118,7 @@ namespace SQLite
 
 		/// <summary>
 		/// Attempts to retrieve the first object that matches the query from the table
-		/// associated with the specified type. 
+		/// associated with the specified type.
 		/// </summary>
 		/// <param name="query">
 		/// The fully escaped SQL.
@@ -1107,7 +1137,7 @@ namespace SQLite
 
 		/// <summary>
 		/// Attempts to retrieve the first object that matches the query from the table
-		/// associated with the specified type. 
+		/// associated with the specified type.
 		/// </summary>
 		/// <param name="map">
 		/// The TableMapping used to identify the table.
@@ -1140,9 +1170,9 @@ namespace SQLite
 		/// <example cref="System.InvalidOperationException">Throws if a transaction has already begun.</example>
 		public void BeginTransaction ()
 		{
-			// The BEGIN command only works if the transaction stack is empty, 
-			//    or in other words if there are no pending transactions. 
-			// If the transaction stack is not empty when the BEGIN command is invoked, 
+			// The BEGIN command only works if the transaction stack is empty,
+			//    or in other words if there are no pending transactions.
+			// If the transaction stack is not empty when the BEGIN command is invoked,
 			//    then the command fails with an error.
 			// Rather than crash with an error, we will just ignore calls to BeginTransaction
 			//    that would result in an error.
@@ -1153,7 +1183,7 @@ namespace SQLite
 				catch (Exception ex) {
 					var sqlExp = ex as SQLiteException;
 					if (sqlExp != null) {
-						// It is recommended that applications respond to the errors listed below 
+						// It is recommended that applications respond to the errors listed below
 						//    by explicitly issuing a ROLLBACK command.
 						// TODO: This rollback failsafe should be localized to all throw sites.
 						switch (sqlExp.Result) {
@@ -1167,7 +1197,7 @@ namespace SQLite
 						}
 					}
 					else {
-						// Call decrement and not VolatileWrite in case we've already 
+						// Call decrement and not VolatileWrite in case we've already
 						//    created a transaction point in SaveTransactionPoint since the catch.
 						Interlocked.Decrement (ref _transactionDepth);
 					}
@@ -1184,7 +1214,7 @@ namespace SQLite
 		/// <summary>
 		/// Creates a savepoint in the database at the current point in the transaction timeline.
 		/// Begins a new transaction if one is not in progress.
-		/// 
+		///
 		/// Call <see cref="RollbackTo(string)"/> to undo transactions since the returned savepoint.
 		/// Call <see cref="Release"/> to commit transactions after the savepoint returned here.
 		/// Call <see cref="Commit"/> to end the transaction, committing all changes.
@@ -1201,7 +1231,7 @@ namespace SQLite
 			catch (Exception ex) {
 				var sqlExp = ex as SQLiteException;
 				if (sqlExp != null) {
-					// It is recommended that applications respond to the errors listed below 
+					// It is recommended that applications respond to the errors listed below
 					//    by explicitly issuing a ROLLBACK command.
 					// TODO: This rollback failsafe should be localized to all throw sites.
 					switch (sqlExp.Result) {
@@ -1248,8 +1278,8 @@ namespace SQLite
 		/// <param name="noThrow">true to avoid throwing exceptions, false otherwise</param>
 		void RollbackTo (string savepoint, bool noThrow)
 		{
-			// Rolling back without a TO clause rolls backs all transactions 
-			//    and leaves the transaction stack empty.   
+			// Rolling back without a TO clause rolls backs all transactions
+			//    and leaves the transaction stack empty.
 			try {
 				if (String.IsNullOrEmpty (savepoint)) {
 					if (Interlocked.Exchange (ref _transactionDepth, 0) > 0) {
@@ -1269,16 +1299,33 @@ namespace SQLite
 		}
 
 		/// <summary>
-		/// Releases a savepoint returned from <see cref="SaveTransactionPoint"/>.  Releasing a savepoint 
+		/// Releases a savepoint returned from <see cref="SaveTransactionPoint"/>.  Releasing a savepoint
 		///    makes changes since that savepoint permanent if the savepoint began the transaction,
 		///    or otherwise the changes are permanent pending a call to <see cref="Commit"/>.
-		/// 
+		///
 		/// The RELEASE command is like a COMMIT for a SAVEPOINT.
 		/// </summary>
 		/// <param name="savepoint">The name of the savepoint to release.  The string should be the result of a call to <see cref="SaveTransactionPoint"/></param>
 		public void Release (string savepoint)
 		{
-			DoSavePointExecute (savepoint, "release ");
+			try {
+				DoSavePointExecute (savepoint, "release ");
+			}
+			catch (SQLiteException ex) {
+				if (ex.Result == SQLite3.Result.Busy) {
+					// Force a rollback since most people don't know this function can fail
+					// Don't call Rollback() since the _transactionDepth is 0 and it won't try
+					// Calling rollback makes our _transactionDepth variable correct.
+					// Writes to the database only happen at depth=0, so this failure will only happen then.
+					try {
+						Execute ("rollback");
+					}
+					catch {
+						// rollback can fail in all sorts of wonderful version-dependent ways. Let's just hope for the best
+					}
+				}
+				throw;
+			}
 		}
 
 		void DoSavePointExecute (string savepoint, string cmd)
@@ -1312,7 +1359,21 @@ namespace SQLite
 		public void Commit ()
 		{
 			if (Interlocked.Exchange (ref _transactionDepth, 0) != 0) {
-				Execute ("commit");
+				try {
+					Execute ("commit");
+				}
+				catch {
+					// Force a rollback since most people don't know this function can fail
+					// Don't call Rollback() since the _transactionDepth is 0 and it won't try
+					// Calling rollback makes our _transactionDepth variable correct.
+					try {
+						Execute ("rollback");
+					}
+					catch {
+						// rollback can fail in all sorts of wonderful version-dependent ways. Let's just hope for the best
+					}
+					throw;
+				}
 			}
 			// Do nothing on a commit with no open transaction
 		}
@@ -1578,7 +1639,7 @@ namespace SQLite
 				vals[i] = cols[i].GetValue (obj);
 			}
 
-			var insertCmd = map.GetInsertCommand (this, extra);
+			var insertCmd = GetInsertCommand (map, extra);
 			int count;
 
 			lock (insertCmd) {
@@ -1603,6 +1664,61 @@ namespace SQLite
 				OnTableChanged (map, NotifyTableChangedAction.Insert);
 
 			return count;
+		}
+
+		readonly Dictionary<Tuple<string, string>, PreparedSqlLiteInsertCommand> _insertCommandMap = new Dictionary<Tuple<string, string>, PreparedSqlLiteInsertCommand> ();
+
+		PreparedSqlLiteInsertCommand GetInsertCommand (TableMapping map, string extra)
+		{
+			PreparedSqlLiteInsertCommand prepCmd;
+
+			var key = Tuple.Create (map.MappedType.FullName, extra);
+
+			lock (_insertCommandMap) {
+				_insertCommandMap.TryGetValue (key, out prepCmd);
+			}
+
+			if (prepCmd == null) {
+				prepCmd = CreateInsertCommand (map, extra);
+				var added = false;
+				lock (_insertCommandMap) {
+					if (!_insertCommandMap.ContainsKey (key)) {
+						_insertCommandMap.Add (key, prepCmd);
+						added = true;
+					}
+				}
+				if (!added) {
+					prepCmd.Dispose ();
+				}
+			}
+
+			return prepCmd;
+		}
+
+		PreparedSqlLiteInsertCommand CreateInsertCommand (TableMapping map, string extra)
+		{
+			var cols = map.InsertColumns;
+			string insertSql;
+			if (cols.Length == 0 && map.Columns.Length == 1 && map.Columns[0].IsAutoInc) {
+				insertSql = string.Format ("insert {1} into \"{0}\" default values", map.TableName, extra);
+			}
+			else {
+				var replacing = string.Compare (extra, "OR REPLACE", StringComparison.OrdinalIgnoreCase) == 0;
+
+				if (replacing) {
+					cols = map.InsertOrReplaceColumns;
+				}
+
+				insertSql = string.Format ("insert {3} into \"{0}\"({1}) values ({2})", map.TableName,
+								   string.Join (",", (from c in cols
+													  select "\"" + c.Name + "\"").ToArray ()),
+								   string.Join (",", (from c in cols
+													  select "?").ToArray ()), extra);
+
+			}
+
+			var insertCommand = new PreparedSqlLiteInsertCommand (this, insertSql);
+			return insertCommand;
 		}
 
 		/// <summary>
@@ -1844,10 +1960,11 @@ namespace SQLite
 			if (_open && Handle != NullHandle) {
 				try {
 					if (disposing) {
-						if (_mappings != null) {
-							foreach (var sqlInsertCommand in _mappings.Values) {
+						lock (_insertCommandMap) {
+							foreach (var sqlInsertCommand in _insertCommandMap.Values) {
 								sqlInsertCommand.Dispose ();
 							}
+							_insertCommandMap.Clear ();
 						}
 
 						var r = useClose2 ? SQLite3.Close2 (Handle) : SQLite3.Close (Handle);
@@ -1942,6 +2059,13 @@ namespace SQLite
 	{
 		public string Name { get; set; }
 
+		/// <summary>
+		/// Flag whether to create the table without rowid (see https://sqlite.org/withoutrowid.html)
+		///
+		/// The default is <c>false</c> so that sqlite adds an implicit <c>rowid</c> to every table created.
+		/// </summary>
+		public bool WithoutRowId { get; set; }
+
 		public TableAttribute (string name)
 		{
 			Name = name;
@@ -2012,6 +2136,12 @@ namespace SQLite
 		}
 	}
 
+	public sealed class PreserveAttribute : System.Attribute
+	{
+		public bool AllMembers;
+		public bool Conditional;
+	}
+
 	/// <summary>
 	/// Select the collating sequence to use on a column.
 	/// "BINARY", "NOCASE", and "RTRIM" are supported.
@@ -2044,19 +2174,24 @@ namespace SQLite
 
 		public string TableName { get; private set; }
 
+		public bool WithoutRowId { get; private set; }
+
 		public Column[] Columns { get; private set; }
 
 		public Column PK { get; private set; }
 
 		public string GetByPrimaryKeySql { get; private set; }
 
-		Column _autoPk;
-		Column[] _insertColumns;
-		Column[] _insertOrReplaceColumns;
+		public CreateFlags CreateFlags { get; private set; }
+
+		readonly Column _autoPk;
+		readonly Column[] _insertColumns;
+		readonly Column[] _insertOrReplaceColumns;
 
 		public TableMapping (Type type, CreateFlags createFlags = CreateFlags.None)
 		{
 			MappedType = type;
+			CreateFlags = createFlags;
 
 			var typeInfo = type.GetTypeInfo ();
 			var tableAttr =
@@ -2066,6 +2201,7 @@ namespace SQLite
 						.FirstOrDefault ();
 
 			TableName = (tableAttr != null && !string.IsNullOrEmpty (tableAttr.Name)) ? tableAttr.Name : MappedType.Name;
+			WithoutRowId = tableAttr != null ? tableAttr.WithoutRowId : false;
 
 			var props = new List<PropertyInfo> ();
 			var baseType = type;
@@ -2114,7 +2250,9 @@ namespace SQLite
 				// People should not be calling Get/Find without a PK
 				GetByPrimaryKeySql = string.Format ("select * from \"{0}\" limit 1", TableName);
 			}
-			_insertCommandMap = new ConcurrentStringDictionary ();
+
+			_insertColumns = Columns.Where (c => !c.IsAutoInc).ToArray ();
+			_insertOrReplaceColumns = Columns.ToArray ();
 		}
 
 		public bool HasAutoIncPK { get; private set; }
@@ -2128,18 +2266,12 @@ namespace SQLite
 
 		public Column[] InsertColumns {
 			get {
-				if (_insertColumns == null) {
-					_insertColumns = Columns.Where (c => !c.IsAutoInc).ToArray ();
-				}
 				return _insertColumns;
 			}
 		}
 
 		public Column[] InsertOrReplaceColumns {
 			get {
-				if (_insertOrReplaceColumns == null) {
-					_insertOrReplaceColumns = Columns.ToArray ();
-				}
 				return _insertOrReplaceColumns;
 			}
 		}
@@ -2154,59 +2286,6 @@ namespace SQLite
 		{
 			var exact = Columns.FirstOrDefault (c => c.Name.ToLower () == columnName.ToLower ());
 			return exact;
-		}
-
-		ConcurrentStringDictionary _insertCommandMap;
-
-		public PreparedSqlLiteInsertCommand GetInsertCommand (SQLiteConnection conn, string extra)
-		{
-			object prepCmdO;
-
-			if (!_insertCommandMap.TryGetValue (extra, out prepCmdO)) {
-				var prepCmd = CreateInsertCommand (conn, extra);
-				prepCmdO = prepCmd;
-				if (!_insertCommandMap.TryAdd (extra, prepCmd)) {
-					// Concurrent add attempt beat us.
-					prepCmd.Dispose ();
-					_insertCommandMap.TryGetValue (extra, out prepCmdO);
-				}
-			}
-			return (PreparedSqlLiteInsertCommand)prepCmdO;
-		}
-
-		PreparedSqlLiteInsertCommand CreateInsertCommand (SQLiteConnection conn, string extra)
-		{
-			var cols = InsertColumns;
-			string insertSql;
-			if (!cols.Any () && Columns.Count () == 1 && Columns[0].IsAutoInc) {
-				insertSql = string.Format ("insert {1} into \"{0}\" default values", TableName, extra);
-			}
-			else {
-				var replacing = string.Compare (extra, "OR REPLACE", StringComparison.OrdinalIgnoreCase) == 0;
-
-				if (replacing) {
-					cols = InsertOrReplaceColumns;
-				}
-
-				insertSql = string.Format ("insert {3} into \"{0}\"({1}) values ({2})", TableName,
-								   string.Join (",", (from c in cols
-													  select "\"" + c.Name + "\"").ToArray ()),
-								   string.Join (",", (from c in cols
-													  select "?").ToArray ()), extra);
-
-			}
-
-			var insertCommand = new PreparedSqlLiteInsertCommand (conn);
-			insertCommand.CommandText = insertSql;
-			return insertCommand;
-		}
-
-		protected internal void Dispose ()
-		{
-			foreach (var pair in _insertCommandMap) {
-				((PreparedSqlLiteInsertCommand)pair.Value).Dispose ();
-			}
-			_insertCommandMap = null;
 		}
 
 		public class Column
@@ -2299,10 +2378,10 @@ namespace SQLite
 				StoreAsText = typeInfo.CustomAttributes.Any (x => x.AttributeType == typeof (StoreAsTextAttribute));
 
 				if (StoreAsText) {
-					EnumValues = Enum.GetValues (type).Cast<object> ().ToDictionary (Convert.ToInt32, x => x.ToString ());
-				}
-				else {
-					EnumValues = Enum.GetValues (type).Cast<object> ().ToDictionary (Convert.ToInt32, x => Convert.ToInt32 (x).ToString ());
+					EnumValues = new Dictionary<int, string> ();
+					foreach (object e in Enum.GetValues (type)) {
+						EnumValues[Convert.ToInt32 (e)] = e.ToString ();
+					}
 				}
 			}
 		}
@@ -2382,7 +2461,7 @@ namespace SQLite
 			else if (clrType == typeof (Single) || clrType == typeof (Double) || clrType == typeof (Decimal)) {
 				return "float";
 			}
-			else if (clrType == typeof (String)) {
+			else if (clrType == typeof (String) || clrType == typeof (StringBuilder) || clrType == typeof (Uri) || clrType == typeof (UriBuilder)) {
 				int? len = p.MaxStringLength;
 
 				if (len.HasValue)
@@ -2731,6 +2810,15 @@ namespace SQLite
 				else if (value is Guid) {
 					SQLite3.BindText (stmt, index, ((Guid)value).ToString (), 72, NegativePointer);
 				}
+				else if (value is Uri) {
+					SQLite3.BindText (stmt, index, ((Uri)value).ToString (), -1, NegativePointer);
+				}
+				else if (value is StringBuilder) {
+					SQLite3.BindText (stmt, index, ((StringBuilder)value).ToString (), -1, NegativePointer);
+				}
+				else if (value is UriBuilder) {
+					SQLite3.BindText (stmt, index, ((UriBuilder)value).ToString (), -1, NegativePointer);
+				}
 				else {
 					// Now we could possibly get an enum, retrieve cached info
 					var valueType = value.GetType ();
@@ -2835,6 +2923,18 @@ namespace SQLite
 					var text = SQLite3.ColumnString (stmt, index);
 					return new Guid (text);
 				}
+                else if (clrType == typeof(Uri)) {
+                    var text = SQLite3.ColumnString(stmt, index);
+                    return new Uri(text);
+                }
+				else if (clrType == typeof (StringBuilder)) {
+					var text = SQLite3.ColumnString (stmt, index);
+					return new StringBuilder (text);
+				}
+				else if (clrType == typeof(UriBuilder)) {
+                    var text = SQLite3.ColumnString(stmt, index);
+                    return new UriBuilder(text);
+                }
 				else {
 					throw new NotSupportedException ("Don't know how to read " + clrType);
 				}
@@ -2845,24 +2945,29 @@ namespace SQLite
 	/// <summary>
 	/// Since the insert never changed, we only need to prepare once.
 	/// </summary>
-	public class PreparedSqlLiteInsertCommand : IDisposable
+	class PreparedSqlLiteInsertCommand : IDisposable
 	{
-		public bool Initialized { get; set; }
+		bool Initialized;
 
-		protected SQLiteConnection Connection { get; set; }
+		SQLiteConnection Connection;
 
-		public string CommandText { get; set; }
+		string CommandText;
 
-		protected Sqlite3Statement Statement { get; set; }
-		internal static readonly Sqlite3Statement NullStatement = default (Sqlite3Statement);
+		Sqlite3Statement Statement;
+		static readonly Sqlite3Statement NullStatement = default (Sqlite3Statement);
 
-		internal PreparedSqlLiteInsertCommand (SQLiteConnection conn)
+		public PreparedSqlLiteInsertCommand (SQLiteConnection conn, string commandText)
 		{
 			Connection = conn;
+			CommandText = commandText;
 		}
 
 		public int ExecuteNonQuery (object[] source)
 		{
+			if (Initialized && Statement == NullStatement) {
+				throw new ObjectDisposedException (nameof (PreparedSqlLiteInsertCommand));
+			}
+
 			if (Connection.Trace) {
 				Connection.Tracer?.Invoke ("Executing: " + CommandText);
 			}
@@ -2870,7 +2975,7 @@ namespace SQLite
 			var r = SQLite3.Result.OK;
 
 			if (!Initialized) {
-				Statement = Prepare ();
+				Statement = SQLite3.Prepare2 (Connection.Handle, CommandText);
 				Initialized = true;
 			}
 
@@ -2902,28 +3007,19 @@ namespace SQLite
 			}
 		}
 
-		protected virtual Sqlite3Statement Prepare ()
-		{
-			var stmt = SQLite3.Prepare2 (Connection.Handle, CommandText);
-			return stmt;
-		}
-
 		public void Dispose ()
 		{
 			Dispose (true);
 			GC.SuppressFinalize (this);
 		}
 
-		private void Dispose (bool disposing)
+		void Dispose (bool disposing)
 		{
-			if (Statement != NullStatement) {
-				try {
-					SQLite3.Finalize (Statement);
-				}
-				finally {
-					Statement = NullStatement;
-					Connection = null;
-				}
+			var s = Statement;
+			Statement = NullStatement;
+			Connection = null;
+			if (s != NullStatement) {
+				SQLite3.Finalize (s);
 			}
 		}
 
@@ -3349,6 +3445,9 @@ namespace SQLite
 				else if (call.Method.Name == "ToUpper") {
 					sqlCall = "(upper(" + obj.CommandText + "))";
 				}
+				else if (call.Method.Name == "Replace" && args.Length == 2) {
+					sqlCall = "(replace(" + obj.CommandText + "," + args[0].CommandText + "," + args[1].CommandText + "))";
+				}
 				else {
 					sqlCall = call.Method.Name.ToLower () + "(" + string.Join (",", args.Select (a => a.CommandText).ToArray ()) + ")";
 				}
@@ -3568,7 +3667,7 @@ namespace SQLite
 		public T First ()
 		{
 			var query = Take (1);
-			return query.ToList<T> ().First ();
+			return query.ToList ().First ();
 		}
 
 		/// <summary>
@@ -3577,7 +3676,7 @@ namespace SQLite
 		public T FirstOrDefault ()
 		{
 			var query = Take (1);
-			return query.ToList<T> ().FirstOrDefault ();
+			return query.ToList ().FirstOrDefault ();
 		}
 
 		/// <summary>
@@ -3703,7 +3802,7 @@ namespace SQLite
 
 		[DllImport(LibraryPath, EntryPoint = "sqlite3_open_v2", CallingConvention=CallingConvention.Cdecl)]
 		public static extern Result Open ([MarshalAs(UnmanagedType.LPStr)] string filename, out IntPtr db, int flags, IntPtr zvfs);
-		
+
 		[DllImport(LibraryPath, EntryPoint = "sqlite3_open_v2", CallingConvention = CallingConvention.Cdecl)]
 		public static extern Result Open(byte[] filename, out IntPtr db, int flags, IntPtr zvfs);
 
@@ -3715,16 +3814,16 @@ namespace SQLite
 
 		[DllImport(LibraryPath, EntryPoint = "sqlite3_close", CallingConvention=CallingConvention.Cdecl)]
 		public static extern Result Close (IntPtr db);
-		
+
 		[DllImport(LibraryPath, EntryPoint = "sqlite3_close_v2", CallingConvention = CallingConvention.Cdecl)]
 		public static extern Result Close2(IntPtr db);
-		
+
 		[DllImport(LibraryPath, EntryPoint = "sqlite3_initialize", CallingConvention=CallingConvention.Cdecl)]
 		public static extern Result Initialize();
-						
+
 		[DllImport(LibraryPath, EntryPoint = "sqlite3_shutdown", CallingConvention=CallingConvention.Cdecl)]
 		public static extern Result Shutdown();
-		
+
 		[DllImport(LibraryPath, EntryPoint = "sqlite3_config", CallingConvention=CallingConvention.Cdecl)]
 		public static extern Result Config (ConfigOption option);
 
@@ -4074,24 +4173,3 @@ namespace SQLite
 		}
 	}
 }
-
-#if NO_CONCURRENT
-namespace SQLite.Extensions
-{
-	public static class ListEx
-	{
-		public static bool TryAdd<TKey, TValue> (this IDictionary<TKey, TValue> dict, TKey key, TValue value)
-		{
-			try {
-				dict.Add (key, value);
-				return true;
-			}
-			catch (ArgumentException) {
-				return false;
-			}
-		}
-	}
-}
-#endif
-
-
