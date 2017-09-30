@@ -2315,7 +2315,7 @@ namespace SQLite
 
 			public bool StoreAsText { get; private set; }
 
-			public Column (PropertyInfo prop, CreateFlags createFlags = CreateFlags.None)
+			public Column (PropertyInfo prop, CreateFlags createFlags = CreateFlags.ImplicitPK)
 			{
 				var colAttr = prop.CustomAttributes.FirstOrDefault (x => x.AttributeType == typeof (ColumnAttribute));
 
@@ -2419,7 +2419,7 @@ namespace SQLite
 	public static class Orm
 	{
 		public const int DefaultMaxStringLength = 140;
-		public const string ImplicitPkName = "Id";
+		public const string ImplicitPkName = "ObjectId";
 		public const string ImplicitIndexSuffix = "Id";
 
 		public static Type GetType (object obj)
