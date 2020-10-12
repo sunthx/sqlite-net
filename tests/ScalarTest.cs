@@ -29,7 +29,7 @@ namespace SQLite.Tests
 			var db = new TestDb ();
 			db.CreateTable<TestTable> ();
 			var items = from i in Enumerable.Range (0, Count)
-				select new TestTable { Two = 2 };
+						select new TestTable { Two = 2 };
 			db.InsertAll (items);
 			Assert.AreEqual (Count, db.Table<TestTable> ().Count ());
 			return db;
@@ -40,10 +40,16 @@ namespace SQLite.Tests
 		public void Int32 ()
 		{
 			var db = CreateDb ();
-			
+
 			var r = db.ExecuteScalar<int> ("SELECT SUM(Two) FROM TestTable");
 
 			Assert.AreEqual (Count * 2, r);
+
+			db.DeleteAll<TestTable> ();
+
+			var r1 = db.ExecuteScalar<int> ("SELECT SUM(Two) FROM TestTable");
+
+			Assert.AreEqual (0, r1);
 		}
 
 		[Test]
@@ -54,6 +60,37 @@ namespace SQLite.Tests
 			var r = db.ExecuteScalar<int> ("SELECT Two FROM TestTable WHERE Id = 1 LIMIT 1");
 
 			Assert.AreEqual (2, r);
+		}
+
+		[Test]
+		public void SelectNullableSingleRowValue ()
+		{
+			var db = CreateDb ();
+
+			var r = db.ExecuteScalar<int?> ("SELECT Two FROM TestTable WHERE Id = 1 LIMIT 1");
+
+			Assert.AreEqual (true, r.HasValue);
+			Assert.AreEqual (2, r);
+		}
+
+		[Test]
+		public void SelectNoRowValue ()
+		{
+			var db = CreateDb ();
+
+			var r = db.ExecuteScalar<int?> ("SELECT Two FROM TestTable WHERE Id = 999");
+
+			Assert.AreEqual (false, r.HasValue);
+		}
+
+		[Test]
+		public void SelectNullRowValue ()
+		{
+			var db = CreateDb ();
+
+			var r = db.ExecuteScalar<int?> ("SELECT null AS Unknown FROM TestTable WHERE Id = 1 LIMIT 1");
+
+			Assert.AreEqual (false, r.HasValue);
 		}
 	}
 }
